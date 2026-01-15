@@ -1,0 +1,149 @@
+---
+title: "Task V - Bivariate Correlations (Partial Correlations)"
+author: "Clara Khuon"
+date: "January 15th, 2026"
+output: html_document
+---
+
+## Correlations for Task V with PHQ Scores at Timepoint 2 ##
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Set working directory
+setwd("...")
+
+# Load libraries
+library(tidyverse)
+library(here)
+library(caret)
+library(lattice)
+library(parallel)
+library(doParallel)
+library(foreach)
+library(glmnet)
+library(Hmisc)
+library(randomForest)
+library(lsr)
+library(car)
+library(ggplot2)
+library(corrplot)
+library(ppcor)
+
+# Load data
+demographic_data <- read_csv(file = here("demographic_data.csv"))
+taskV_TAASSC <- read_csv(file = here("taskV_linguistic_data_TAASSC.csv"))
+taskV_SCA <- read_csv(file = here("taskV_linguistic_data_SCA.csv"))
+
+# Note: File names above are example placeholders
+
+```
+
+# Preprocessing 1
+```{r}
+# Filter demographic dataset to specific variables
+taskV_demographic_variables <- c("UserID_v2", "T2_PHQ9_Total", "Age", "Gender", "Education", "Diagnosis_Onset", "TaskV_1_Acceptability1", "TaskV_1_Acceptability2", "TaskV_1_Acceptability3")
+taskV_demographic_data <- demographic_data[, taskV_demographic_variables]
+
+# Order SCA dataset in ascending order of participant ID number
+taskV_SCA$filename <- basename(taskV_TAASSC$filename)
+taskV_SCA$filename <- str_remove(taskV_SCA$filename,".txt")
+taskV_SCA$filename <- str_remove(taskV_SCA$filename,"TaskV.Participant")
+taskV_SCA <- taskV_SCA[order(as.numeric(taskV_SCA$filename), decreasing = FALSE), ]
+taskV_SCA$filename <- paste("Participant.", taskV_SCA$filename, sep = "")
+
+# Order TAASSC dataset in ascending order of participant ID number
+taskV_TAASSC$filename <- str_remove(taskV_TAASSC$filename,".txt")
+taskV_TAASSC$filename <- str_remove(taskV_TAASSC$filename,"TaskV.Participant")
+taskV_TAASSC <- taskV_TAASSC[order(as.numeric(taskV_TAASSC$filename), decreasing = FALSE), ]
+taskV_TAASSC$filename <- paste("Participant.", taskV_TAASSC$filename, sep = "")
+
+# Remove predictor variables with near-zero variance from TAASSC dataset
+near_zero_table <- nearZeroVar(taskV_TAASSC, saveMetrics = TRUE)
+near_zero_TAASSC <- nearZeroVar(taskV_TAASSC) 
+taskV_TAASSC <- taskV_TAASSC[,-near_zero_TAASSC]
+
+# Combine demographic dataset with TAASCC and SCA datasets (without duplicate participant ID number and word-count columns)
+taskV_total <- cbind(taskV_demographic_data, taskV_TAASSC, taskV_SCA[,3:16])
+
+# Identify and remove participants with invalid writing samples (i.e., word-count of zero)
+invalid <- filter(taskV_total, nwords == 0)
+taskV_filtered <- filter(taskV_total, nwords != 0)
+
+# Remove second ID column
+taskV_filtered <- taskV_filtered[,-which(colnames(taskV_filtered) == "filename")]
+
+# Define gender and education as categorical variables in final dataset
+taskV_filtered$Gender <- as.factor(taskV_filtered$Gender)
+taskV_filtered$Education <- as.factor(taskV_filtered$Education)
+
+# Final dataset
+taskV_final <- taskV_filtered
+taskV_final
+
+```
+
+# Preprocessing 2
+Identify and remove highly-correlated predictor variables
+```{r}
+# Isolate dataset columns with predictor variables
+taskV_variables <- taskV_final[,which(colnames(taskV_final)=="nwords"):dim(taskV_final)[2]] 
+
+# Create correlation matrix of predictor variables
+cor_matrix <- cor(taskV_variables, use = "complete.obs")
+
+# Identify highly correlated variables
+highly_correlated <- findCorrelation(cor_matrix, cutoff = 0.75)
+
+# Add number of columns to vector of column names to align with length of original filtered dataset
+highly_correlated <- highly_correlated + length(taskV_demographic_variables)
+
+# Remove highly correlated variables from original filtered dataset
+taskV_final <- taskV_final[,-highly_correlated]
+
+# Final dataset
+taskV_final
+
+```
+
+# Partial Correlations with Total Words as Covariate
+Run selection of bivariate correlations (Pearson's) between PHQ-9 total and linguistic features, with total words as a covariate
+```{r}
+taskV_final_df <- taskV_final
+
+taskV_cor1 <- pcor.test(taskV_final_df$T2_PHQ9_Total, taskV_final_df$nn_pobj_deps_NN_struct, taskV_final_df$nwords)
+taskV_cor2 <- pcor.test(taskV_final_df$T2_PHQ9_Total, taskV_final_df$fic_lemma_ttr, taskV_final_df$nwords) 
+taskV_cor3 <- pcor.test(taskV_final_df$T2_PHQ9_Total, taskV_final_df$all_construction_ttr, taskV_final_df$nwords) 
+taskV_cor4 <- pcor.test(taskV_final_df$T2_PHQ9_Total, taskV_final_df$all_lemma_construction_attested, taskV_final_df$nwords) 
+
+```
+
+# Create Results Dataframe
+```{r}
+# create empty 4 x 3 matrix; convert matrix to dataframe; rename column names
+taskV_results <- matrix(NA, nrow = 4, ncol = 3)
+taskV_results <- data.frame(taskV_results) 
+colnames(taskV_results) <- c("variable", "r", "p_value_adjusted")       
+
+# fill dataframe with values from correlation results
+
+# noun phrase complexity
+taskV_results[1,1] <- "nn_pobj_deps_NN_struct"                      # row1 col1 = variable name
+taskV_results[1,2] <- taskV_cor1$estimate                           # row1 col2 = pearson's r from cor1
+taskV_results[1,3] <- p.adjust(taskV_cor1$p.value, method = "fdr")  # row1 col3 = FDR adjusted p-value from cor1
+
+taskV_results[2,1] <- "fic_lemma_ttr"    
+taskV_results[2,2] <- taskV_cor2$estimate         
+taskV_results[2,3] <- p.adjust(taskV_cor2$p.value, method = "fdr")          
+
+taskV_results[3,1] <- "all_construction_ttr"    
+taskV_results[3,2] <- taskV_cor3$estimate         
+taskV_results[3,3] <- p.adjust(taskV_cor3$p.value, method = "fdr")          
+
+taskV_results[4,1] <- "all_lemma_construction_attested"    
+taskV_results[4,2] <- taskV_cor4$estimate         
+taskV_results[4,3] <- p.adjust(taskV_cor4$p.value, method = "fdr")          
+
+taskV_results
+
+```
