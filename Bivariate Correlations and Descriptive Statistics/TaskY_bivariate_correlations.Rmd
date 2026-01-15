@@ -1,0 +1,294 @@
+---
+title: "Task Y - Bivariate Correlations"
+author: "Clara Khuon"
+date: "January 15th, 2026"
+output: html_document
+---
+
+## Correlations for Task Y with PHQ Scores at Timepoint 5 ##
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Set working directory
+setwd("...")
+
+# Load libraries
+library(tidyverse)
+library(here)
+library(caret)
+library(lattice)
+library(parallel)
+library(doParallel)
+library(foreach)
+library(glmnet)
+library(Hmisc)
+library(randomForest)
+library(lsr)
+library(car)
+library(ggplot2)
+library(corrplot)
+
+# Load data
+demographic_data <- read_csv(file = here("demographic_data.csv"))
+taskY_TAASSC <- read_csv(file = here("taskY_linguistic_data_TAASSC.csv"))
+taskY_SCA <- read_csv(file = here("taskY_linguistic_data_SCA.csv"))
+
+# Note: File names above are example placeholders
+
+```
+
+# Preprocessing 1
+```{r}
+# Filter demographic dataset to specific variables
+taskY_demographic_variables <- c("UserID_v2", "T5_PHQ9_Total", "Age", "Gender", "Education", "Diagnosis_Onset", "TaskY_1_Acceptability1", "TaskY_1_Acceptability2", "TaskY_1_Acceptability3")
+taskY_demographic_data <- demographic_data[, taskY_demographic_variables]
+
+# Order SCA dataset in ascending order of participant ID number
+taskY_SCA$filename <- basename(taskY_TAASSC$filename)
+taskY_SCA$filename <- str_remove(taskY_SCA$filename,".txt")
+taskY_SCA$filename <- str_remove(taskY_SCA$filename,"TaskY.Participant")
+taskY_SCA <- taskY_SCA[order(as.numeric(taskY_SCA$filename), decreasing = FALSE), ]
+taskY_SCA$filename <- paste("Participant.", taskY_SCA$filename, sep = "")
+
+# Order TAASSC dataset in ascending order of participant ID number
+taskY_TAASSC$filename <- str_remove(taskY_TAASSC$filename,".txt")
+taskY_TAASSC$filename <- str_remove(taskY_TAASSC$filename,"TaskY.Participant")
+taskY_TAASSC <- taskY_TAASSC[order(as.numeric(taskY_TAASSC$filename), decreasing = FALSE), ]
+taskY_TAASSC$filename <- paste("Participant.", taskY_TAASSC$filename, sep = "")
+
+# Remove predictor variables with near-zero variance from TAASSC dataset
+near_zero_table <- nearZeroVar(taskY_TAASSC, saveMetrics = TRUE)
+near_zero_TAASSC <- nearZeroVar(taskY_TAASSC) 
+taskY_TAASSC <- taskY_TAASSC[,-near_zero_TAASSC]
+
+# Combine demographic dataset with TAASCC and SCA datasets (without duplicate participant ID number and word-count columns)
+taskY_total <- cbind(taskY_demographic_data, taskY_TAASSC, taskY_SCA[,3:16])
+
+# Identify and remove participants with invalid writing samples (i.e., word-count of zero)
+invalid <- filter(taskY_total, nwords == 0)
+taskY_filtered <- filter(taskY_total, nwords != 0)
+
+# Remove second ID column
+taskY_filtered <- taskY_filtered[,-which(colnames(taskY_filtered) == "filename")]
+
+# Define gender and education as categorical variables in final dataset
+taskY_filtered$Gender <- as.factor(taskY_filtered$Gender)
+taskY_filtered$Education <- as.factor(taskY_filtered$Education)
+
+# Final dataset
+taskY_final <- taskY_filtered
+taskY_final
+
+```
+
+# Descriptive Statistics of Writing Samples
+```{r}
+# Average number of words across writing samples
+mean(taskY_final$nwords)
+
+# SD number of words across writing samples
+sd(taskY_final$nwords)
+
+# Min number of words across writing samples
+min(taskY_final$nwords)
+
+# Max number of words across writing samples
+max(taskY_final$nwords)
+
+```
+
+# Descriptive Statistics of Acceptability Scores of Final Participant Sample
+```{r}
+# Acceptability 1 = Difficulty
+length(taskY_final$TaskY_1_Acceptability1)
+mean(taskY_final$TaskY_1_Acceptability1)
+sd(taskY_final$TaskY_1_Acceptability1)
+min(taskY_final$TaskY_1_Acceptability1)
+max(taskY_final$TaskY_1_Acceptability1)
+
+# Acceptability 2 = Interest
+length(taskY_final$TaskY_1_Acceptability2)
+mean(taskY_final$TaskY_1_Acceptability2)
+sd(taskY_final$TaskY_1_Acceptability2)
+min(taskY_final$TaskY_1_Acceptability2)
+max(taskY_final$TaskY_1_Acceptability2)
+
+# Acceptability 3 = Willingness
+length(taskY_final$TaskY_1_Acceptability3)
+mean(taskY_final$TaskY_1_Acceptability3)
+sd(taskY_final$TaskY_1_Acceptability3)
+min(taskY_final$TaskY_1_Acceptability3)
+max(taskY_final$TaskY_1_Acceptability3)
+
+```
+
+# Total PHQ-9 Score Descriptive Statistics
+```{r}
+# Descriptive Statistics
+length(taskY_final$T5_PHQ9_Total) # total number of participants with PHQ-9 total data
+mean(taskY_final$T5_PHQ9_Total)
+sd(taskY_final$T5_PHQ9_Total)
+min(taskY_final$T5_PHQ9_Total)
+max(taskY_final$T5_PHQ9_Total) 
+
+# Total Number by Symptom Severity Category
+nil_to_minimal <- c(0, 1, 2, 3, 4)
+mild <- c(5, 6, 7, 8, 9)
+moderate <- c(10, 11, 12, 13, 14)
+moderately_severe <- c(15, 16, 17, 18, 19)
+severe <- c(20, 21, 22, 23, 24, 25, 26, 27)
+
+nrow(filter(taskY_final, T5_PHQ9_Total %in% nil_to_minimal)) # Nil to Minimal
+nrow(filter(taskY_final, T5_PHQ9_Total %in% mild)) # Mild
+nrow(filter(taskY_final, T5_PHQ9_Total %in% moderate)) # Moderate
+nrow(filter(taskY_final, T5_PHQ9_Total %in% moderately_severe)) # Moderately Severe
+nrow(filter(taskY_final, T5_PHQ9_Total %in% severe)) # Severe
+
+# Total PHQ-9 Score >= 10 (Probable Depression)
+nrow(filter(taskY_final, T5_PHQ9_Total >= 10))
+
+```
+
+# Preprocessing 2
+Identify and remove highly-correlated predictor variables
+```{r}
+# Isolate dataset columns with predictor variables
+taskY_variables <- taskY_final[,which(colnames(taskY_final)=="nwords"):dim(taskY_final)[2]] 
+
+# Create correlation matrix of predictor variables
+cor_matrix <- cor(taskY_variables, use = "complete.obs")
+
+# Identify highly correlated variables
+highly_correlated <- findCorrelation(cor_matrix, cutoff = 0.75)
+
+# Add number of columns to vector of column names to align with length of original filtered dataset
+highly_correlated <- highly_correlated + length(taskY_demographic_variables)
+
+# Remove highly correlated variables from original filtered dataset
+taskY_final <- taskY_final[,-highly_correlated]
+
+# Final dataset
+taskY_final
+
+```
+
+# Preprocessing 3
+Correlations between linguistic variables and total PHQ-9 scores
+With FDR correction
+
+**NOTE: If applying edits that change dimensions of dataset, column reference numbers below need to be updated**
+
+```{r}
+taskY_final_df <- as.data.frame(taskY_final)
+taskY_pvalues <- vector()
+
+j = 1
+for(i in 10:118){
+  taskY_pvalues[j] <- cor.test(taskY_final_df$T5_PHQ9_Total, taskY_final_df[,i])$p.value
+  j <- j+1
+}
+
+# Specify 10:118 so only runs over linguistic variables
+
+taskY_pvalues <- p.adjust(taskY_pvalues, method = "fdr")
+taskY_variables_refined <- colnames(taskY_final[,10:118])[which(taskY_pvalues < .05)]
+taskY_final <- taskY_final[, c(taskY_demographic_variables,taskY_variables_refined)]
+taskY_final
+
+```
+
+## Significant Bivariate Correlations From All Tasks
+```{r}
+
+taskY_cor1 <- cor.test(taskY_final_df$T5_PHQ9_Total, taskY_final_df$nn_pobj_deps_NN_struct)
+taskY_cor2 <- cor.test(taskY_final_df$T5_PHQ9_Total, taskY_final_df$fic_lemma_ttr) 
+#taskY_cor3 <- cor.test(taskY_final_df$T5_PHQ9_Total, taskY_final_df$all_construction_ttr) 
+taskY_cor4 <- cor.test(taskY_final_df$T5_PHQ9_Total, taskY_final_df$all_lemma_construction_attested) 
+taskY_cor5 <- cor.test(taskY_final_df$T5_PHQ9_Total, taskY_final_df$news_av_lemma_construction_freq_type) 
+taskY_cor6 <- cor.test(taskY_final_df$T5_PHQ9_Total, taskY_final_df$news_av_lemma_construction_freq_log_stdev) 
+
+# 1 of the variables had been removed during preprocessing for TaskY
+
+```
+
+# Create Results Dataframe
+With FDR-corrected p-values
+```{r}
+
+# create empty 6 x 3 matrix; convert matrix to dataframe; rename column names
+taskY_results <- matrix(NA, nrow = 6, ncol = 3)
+taskY_results <- data.frame(taskY_results) 
+colnames(taskY_results) <- c("variable", "r", "p_value_adjusted")       
+
+# fill dataframe with values from correlation results
+
+# noun phrase complexity
+taskY_results[1,1] <- "nn_pobj_deps_NN_struct"                      # row1 col1 = variable name
+taskY_results[1,2] <- taskY_cor1$estimate                           # row1 col2 = pearson's r from cor1
+taskY_results[1,3] <- p.adjust(taskY_cor1$p.value, method = "fdr")  # row1 col3 = FDR adjusted p-value from cor1
+
+taskY_results[2,1] <- "fic_lemma_ttr"    
+taskY_results[2,2] <- taskY_cor2$estimate         
+taskY_results[2,3] <- p.adjust(taskY_cor2$p.value, method = "fdr")          
+
+taskY_results[3,1] <- "all_construction_ttr"    
+taskY_results[3,2] <- "NA"         
+taskY_results[3,3] <- "NA"          
+
+taskY_results[4,1] <- "all_lemma_construction_attested"    
+taskY_results[4,2] <- taskY_cor4$estimate         
+taskY_results[4,3] <- p.adjust(taskY_cor4$p.value, method = "fdr")          
+
+taskY_results[5,1] <- "news_av_lemma_construction_freq_type"    
+taskY_results[5,2] <- taskY_cor5$estimate         
+taskY_results[5,3] <- p.adjust(taskY_cor5$p.value, method = "fdr")          
+
+taskY_results[6,1] <- "news_av_lemma_construction_freq_log_stdev"    
+taskY_results[6,2] <- taskY_cor6$estimate         
+taskY_results[6,3] <- p.adjust(taskY_cor6$p.value, method = "fdr")
+
+taskY_results
+
+# NA = variables removed during preprocessing, but significant in other tasks
+
+```
+
+# Scatterplots of Significant Correlations (with regression line)
+Syntactic Sophistication: news_av_lemma_construction_freq_type
+```{r}
+
+taskY_1 <- taskY_final_df %>%
+  ggplot(mapping = aes(x = news_av_lemma_construction_freq_type, y = T5_PHQ9_Total)) + 
+  geom_point() + 
+  geom_smooth(method = "lm", 
+              formula = y ~ x,
+              col = "blue") +
+  theme_classic() +
+  labs(title = "Task Y: Letter to a Friend",
+       subtitle = "Scatterplot between PHQ-9 Total and news_av_lemma_construction_freq_type",
+       x = "news_av_lemma_construction_freq_type (Syntactic Sophistication)",
+       y = "PHQ-9 Score (Total) at Timepoint 5")
+
+taskY_1
+
+```
+
+Syntactic Sophistication: news_av_lemma_construction_freq_log_stdev
+```{r}
+
+taskY_2 <- taskY_final_df %>%
+  ggplot(mapping = aes(x = news_av_lemma_construction_freq_log_stdev, y = T5_PHQ9_Total)) + 
+  geom_point() + 
+  geom_smooth(method = "lm", 
+              formula = y ~ x,
+              col = "blue") +
+  theme_classic() +
+  labs(title = "Task Y: Letter to a Friend",
+       subtitle = "Scatterplot between PHQ-9 Total and news_av_lemma_construction_freq_log_stdev",
+       x = "news_av_lemma_construction_freq_log_stdev (Syntactic Sophistication)",
+       y = "PHQ-9 Score (Total) at Timepoint 5")
+
+taskY_2
+
+```
