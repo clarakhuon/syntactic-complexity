@@ -1,0 +1,263 @@
+---
+title: "Task V - Machine Learning"
+author: "Clara Khuon"
+date: "January 15th, 2026"
+output: html_document
+---
+
+## Task V with PHQ-9 Scores at Timepoint 2 ##
+
+```{r setup, include=FALSE}
+# Set working directory
+setwd("...")
+
+# Load libraries
+library(tidyverse)
+library(here)
+library(caret)
+library(nestedcv)
+library(doParallel)
+library(ggplot2)
+library(fastshap)
+
+# Load data
+demographic_data <- read_csv(file = here("demographic_data.csv"))
+taskV_TAASSC <- read_csv(file = here("taskV_linguistic_data_TAASSC.csv"))
+taskV_SCA <- read_csv(file = here("taskV_linguistic_data_SCA.csv"))
+
+# Note: File names above are example placeholders
+
+```
+
+# Preprocessing
+```{r}
+# Filter demographic dataset to specific variables
+taskV_demographic_variables <- c("UserID_v2", "T2_PHQ9_Total", "Age", "Gender", "Education", "Diagnosis_Onset")
+taskV_demographic_data <- demographic_data[, taskV_demographic_variables]
+
+# Order SCA dataset in ascending order of participant ID number
+taskV_SCA$filename <- basename(taskV_TAASSC$filename)
+taskV_SCA$filename <- str_remove(taskV_SCA$filename,".txt")
+taskV_SCA$filename <- str_remove(taskV_SCA$filename,"TaskV.Participant")
+taskV_SCA <- taskV_SCA[order(as.numeric(taskV_SCA$filename), decreasing = FALSE), ]
+taskV_SCA$filename <- paste("Participant.", taskV_SCA$filename, sep = "")
+
+# Order TAASSC dataset in ascending order of participant ID number
+taskV_TAASSC$filename <- str_remove(taskV_TAASSC$filename,".txt")
+taskV_TAASSC$filename <- str_remove(taskV_TAASSC$filename,"TaskV.Participant")
+taskV_TAASSC <- taskV_TAASSC[order(as.numeric(taskV_TAASSC$filename), decreasing = FALSE), ]
+taskV_TAASSC$filename <- paste("Participant.", taskV_TAASSC$filename, sep = "")
+
+# Remove predictor variables with near-zero variance from TAASSC dataset
+near_zero_table <- nearZeroVar(taskV_TAASSC, saveMetrics = TRUE)
+near_zero_TAASSC <- nearZeroVar(taskV_TAASSC) 
+taskV_TAASSC <- taskV_TAASSC[,-near_zero_TAASSC]
+
+# Combine demographic dataset with TAASCC and SCA datasets (without duplicate participant ID number and word-count columns)
+taskV_total <- cbind(taskV_demographic_data, taskV_TAASSC, taskV_SCA[,3:16])
+
+# Identify and remove participants with invalid writing samples (i.e., word-count of zero)
+invalid <- filter(taskV_total, nwords == 0)
+taskV_filtered <- filter(taskV_total, nwords != 0)
+
+# Remove second ID column
+taskV_filtered <- taskV_filtered[,-which(colnames(taskV_filtered) == "filename")]
+
+# Define gender and education as categorical variables in final dataset
+taskV_filtered$Gender <- as.factor(taskV_filtered$Gender)
+taskV_filtered$Education <- as.factor(taskV_filtered$Education)
+
+# Final dataset
+taskV_final <- taskV_filtered
+taskV_final
+
+```
+
+# Elastic Net with Nested Cross-Validation
+```{r}
+# Start timer
+start_time <- Sys.time()
+
+# Enable parallel processing
+cl <- makeCluster(detectCores(), type = "PSOCK")
+registerDoParallel(cl)
+
+# Set seed
+set.seed(seed = 123)
+
+# Fit and tune elastic net model with nested cross-validation
+taskV_elastic_net <- nestcv.train(x = taskV_final[,7:330], # only linguistic variables
+                                  y = taskV_final$T2_PHQ9_Total,  
+                     method = "glmnet",
+                     metric = "RMSE",
+                     savePredictions = "final",
+                     filterFUN = "correl_filter",
+                     n_outer_folds = 10,
+                     n_inner_folds = 10,
+                     finalCV = TRUE,
+                     preProcess = c("center", "scale", "corr"), 
+                     preProcOptions = list(cutoff = 0.75),
+                     tuneGrid = expand.grid(alpha = seq(0,1,0.1), 
+                                            lambda = 2^c(-10:10)))
+
+# End timer
+end_time <- Sys.time() 
+end_time - start_time
+
+# Hyperparameters of final model
+taskV_elastic_net$finalTune
+
+# Summarise final results
+max(taskV_elastic_net$final_fit$results$Rsquared,na.rm = TRUE) #r-squared of best parameters fit to the whole dataset
+taskV_elastic_net$summary # accounting for overfitting
+
+# Frequency with which predictor variables are kept in final model
+var_stability(taskV_elastic_net)
+taskV_elastic_net_var_stability <- plot_var_stability(taskV_elastic_net, final = FALSE, percent = FALSE, top = 10) 
+taskV_elastic_net_var_stability
+
+# Final variables
+taskV_elastic_net$final_fit # number of variables included in final fit
+taskV_elastic_net$final_vars
+
+```
+
+# Random Forest with Nested Cross-Validation
+```{r}
+# Enable parallel processing
+cl <- makeCluster(detectCores(), type = "PSOCK")
+registerDoParallel(cl)
+
+start_time <- Sys.time()
+
+# set seed
+set.seed(seed = 123)
+
+# Random forest with nested cross-validation
+taskV_rf <- nestcv.train(x = taskV_final[,7:330], 
+                         y = taskV_final$T2_PHQ9_Total,  
+                     method = "rf",
+                     metric = "RMSE",
+                     savePredictions = "final",
+                     filterFUN = "correl_filter",
+                     n_outer_folds = 10,
+                     n_inner_folds = 10,
+                     finalCV = TRUE,
+                     preProcess = c("center", "scale", "corr"),
+                     preProcOptions = list(cutoff = 0.75),
+                     tuneGrid = expand.grid(mtry = 1:40))
+
+end_time <- Sys.time()
+end_time - start_time
+
+# Hyperparameters of final model
+taskV_rf$finalTune
+
+# Results summary
+max(taskV_rf$final_fit$results$Rsquared,na.rm = TRUE) # r-squared of best parameters fit to the whole dataset
+taskV_rf$summary # accounting for overfitting
+
+# Frequency with which predictor variables are kept in final model
+var_stability(taskV_rf)
+taskV_rf_var_stability <- plot_var_stability(taskV_rf, final = FALSE)
+taskV_rf_var_stability
+
+# Variables in final model fit
+taskV_rf$final_fit # number of variables 
+taskV_rf$final_vars # names of variables
+
+```
+
+# Support Vector Machine with Nested Cross-Validation
+```{r}
+# Enable parallel processing
+cl <- makeCluster(detectCores(), type = "PSOCK")
+registerDoParallel(cl)
+
+start_time <- Sys.time()
+
+# set seed
+set.seed(seed = 123)
+
+# Support Vector Machine (Linear) with nested cross-validation
+taskV_svm <- nestcv.train(x = taskV_final[,7:330],
+                          y = taskV_final$T2_PHQ9_Total, 
+                     method = "svmLinear",
+                     metric = "RMSE",
+                     savePredictions = "final",
+                     filterFUN = "correl_filter",
+                     n_outer_folds = 10,
+                     n_inner_folds = 10,
+                     finalCV = TRUE,
+                     preProcess = c("center", "scale", "corr"),
+                     preProcOptions = list(cutoff = 0.75),
+                     tuneGrid = expand.grid(C = 2^c(-10:10)))
+
+end_time <- Sys.time()
+end_time - start_time
+
+# Hyperparameters of final model
+taskV_svm$finalTune
+
+# Results Summary
+max(taskV_svm$final_fit$results$Rsquared,na.rm = TRUE) # r-squared of best parameters fit to the whole dataset
+taskV_svm$summary # accounting for overfitting
+
+# Frequency with which predictor variables are kept in final model
+var_stability(taskV_svm)
+taskV_svm_var_stability <- plot_var_stability(taskV_svm, final = FALSE, top = 10) 
+taskV_svm_var_stability
+
+# Variables in final model fit
+taskV_svm$final_fit # number of variables 
+taskV_svm$final_vars # names of variables
+
+```
+
+# Plot Support Vector Machine Predicted vs. Observed Values
+```{r}
+
+# Plot predictions 
+predict_taskV_svm <- predict(taskV_svm, taskV_final[,c(2,7:330)])
+
+# Create lm model to plot
+model_taskV_svm <- lm(taskV_svm$output$testy ~ taskV_svm$output$predy)
+                        
+# Plot result
+taskV_svm_predictions <- model_taskV_svm %>%
+  ggplot(mapping = aes(x = taskV_svm$output$testy,
+                       y = taskV_svm$output$predy)) +
+  geom_point() +
+  geom_smooth(formula = y ~ x, method = lm) +
+  theme_bw() +
+  labs(title = "Task V: Support Vector Machine",
+       subtitle = "Linguistic variables only",
+       x = "Observed PHQ-9 Score (Total)",
+       y = "Predicted PHQ-9 Score (Total)")
+
+# Display plot
+taskV_svm_predictions
+
+```
+
+# Plot SHAP Values of Final Support Vector Machine Model 
+Simulations = 1000
+```{r}
+# Start timer
+start_time <- Sys.time()
+
+shap <- fastshap::explain(taskV_svm, X = taskV_final[,7:330], pred_wrapper = pred_train, nsim = 1000)
+
+plot_shap_bar(shap, taskV_final[,7:330], top = 10)
+
+# End timer
+end_time <- Sys.time() 
+end_time - start_time
+
+```
+
+# Create Beeswarm Plot
+```{r}
+plot_shap_beeswarm(shap, taskV_final[,7:330], size = 1, top = 10)
+
+```

@@ -1,0 +1,308 @@
+---
+title: "Task W - Machine Learning"
+author: "Clara Khuon"
+date: "January 15th, 2026"
+output: html_document
+---
+
+## Task W with PHQ-9 Scores at Timepoint 3 ##
+
+```{r setup, include=FALSE}
+# Set working directory
+setwd("...")
+
+# Load libraries
+library(tidyverse)
+library(here)
+library(caret)
+library(nestedcv)
+library(doParallel)
+library(ggplot2)
+library(fastshap)
+
+# Load data
+demographic_data <- read_csv(file = here("demographic_data.csv"))
+taskW_TAASSC <- read_csv(file = here("taskW_linguistic_data_TAASSC.csv"))
+taskW_SCA <- read_csv(file = here("taskW_linguistic_data_SCA.csv"))
+
+# Note: File names above are example placeholders
+
+```
+
+# Preprocessing
+```{r}
+# Filter demographic dataset to specific variables
+taskW_demographic_variables <- c("UserID_v2", "T3_PHQ9_Total", "Age", "Gender", "Education", "Diagnosis_Onset")
+taskW_demographic_data <- demographic_data[, taskW_demographic_variables]
+
+# Order SCA dataset in ascending order of participant ID number
+taskW_SCA$filename <- basename(taskW_TAASSC$filename)
+taskW_SCA$filename <- str_remove(taskW_SCA$filename,".txt")
+taskW_SCA$filename <- str_remove(taskW_SCA$filename,"TaskW.Participant")
+taskW_SCA <- taskW_SCA[order(as.numeric(taskW_SCA$filename), decreasing = FALSE), ]
+taskW_SCA$filename <- paste("Participant.", taskW_SCA$filename, sep = "")
+
+# Order TAASSC dataset in ascending order of participant ID number
+taskW_TAASSC$filename <- str_remove(taskW_TAASSC$filename,".txt")
+taskW_TAASSC$filename <- str_remove(taskW_TAASSC$filename,"TaskW.Participant")
+taskW_TAASSC <- taskW_TAASSC[order(as.numeric(taskW_TAASSC$filename), decreasing = FALSE), ]
+taskW_TAASSC$filename <- paste("Participant.", taskW_TAASSC$filename, sep = "")
+
+# Remove predictor variables with near-zero variance from TAASSC dataset
+near_zero_table <- nearZeroVar(taskW_TAASSC, saveMetrics = TRUE)
+near_zero_TAASSC <- nearZeroVar(taskW_TAASSC) 
+taskW_TAASSC <- taskW_TAASSC[,-near_zero_TAASSC]
+
+# Combine demographic dataset with TAASCC and SCA datasets (without duplicate participant ID number and word-count columns)
+taskW_total <- cbind(taskW_demographic_data, taskW_TAASSC, taskW_SCA[,3:16])
+
+# Identify and remove participants with invalid writing samples (i.e., word-count of zero)
+invalid <- filter(taskW_total, nwords == 0)
+taskW_filtered <- filter(taskW_total, nwords != 0)
+
+# Remove second ID column
+taskW_filtered <- taskW_filtered[,-which(colnames(taskW_filtered) == "filename")]
+
+# Define gender and education as categorical variables in final dataset
+taskW_filtered$Gender <- as.factor(taskW_filtered$Gender)
+taskW_filtered$Education <- as.factor(taskW_filtered$Education)
+
+# Final dataset
+taskW_final <- taskW_filtered
+taskW_final
+
+```
+
+# Elastic Net with Nested Cross-Validation
+```{r}
+# Start timer
+start_time <- Sys.time()
+
+# Enable parallel processing
+cl <- makeCluster(detectCores(), type = "PSOCK")
+registerDoParallel(cl)
+
+# Set seed
+set.seed(seed = 123)
+
+# Fit and tune elastic net model with nested cross-validation
+taskW_elastic_net <- nestcv.train(x = taskW_final[,7:328], # only linguistic variables
+                                  y = taskW_final$T3_PHQ9_Total,  
+                     method = "glmnet",
+                     metric = "RMSE",
+                     savePredictions = "final",
+                     filterFUN = "correl_filter",
+                     n_outer_folds = 10,
+                     n_inner_folds = 10,
+                     finalCV = TRUE,
+                     preProcess = c("center", "scale", "corr"),
+                     preProcOptions = list(cutoff = 0.75),
+                     tuneGrid = expand.grid(alpha = seq(0,1,0.1),
+                                            lambda = 2^c(-10:10)))
+
+# End timer
+end_time <- Sys.time() 
+end_time - start_time
+
+# Hyperparameters of final model
+taskW_elastic_net$finalTune
+
+# Summarise final results
+max(taskW_elastic_net$final_fit$results$Rsquared,na.rm = TRUE) #r-squared of best parameters fit to the whole dataset
+taskW_elastic_net$summary # accounting for overfitting
+
+# Frequency with which predictor variables are kept in final model
+var_stability(taskW_elastic_net)
+taskW_elastic_net_var_stability <- plot_var_stability(taskW_elastic_net, final = FALSE, percent = FALSE, top = 10) 
+taskW_elastic_net_var_stability
+
+# Variables in final model fit
+taskW_elastic_net$final_fit # number of variables 
+taskW_elastic_net$final_vars # names of variables
+
+```
+
+# Plot Elastic Net Predicted vs. Observed Values
+```{r}
+
+# Plot predictions 
+predict_taskW_elastic_net <- predict(taskW_elastic_net, taskW_final[,c(2,7:328)])
+
+# Create lm model to plot
+model_taskW_elastic_net <- lm(taskW_elastic_net$output$testy ~ taskW_elastic_net$output$predy)
+                        
+# Plot result
+taskW_elastic_net_predictions <- model_taskW_elastic_net %>%
+  ggplot(mapping = aes(x = taskW_elastic_net$output$testy,
+                       y = taskW_elastic_net$output$predy)) +
+  geom_point() +
+  geom_smooth(formula = y ~ x, method = lm) +
+  theme_bw() +
+  labs(title = "Task W: Elastic Net",
+       subtitle = "Linguistic variables only",
+       x = "Observed PHQ-9 Score (Total)",
+       y = "Predicted PHQ-9 Score (Total)")
+
+# Display plot
+taskW_elastic_net_predictions
+
+```
+
+# Plot Coefficients of Final Elastic Net Model
+```{r}
+# Access the final nestedcv model
+final_model_taskW_elastic_net <- taskW_elastic_net$final_fit$finalModel
+
+#Identify optimal lambda 
+best_lambda <- final_model_taskW_elastic_net$lambdaOpt
+
+# Extract coefficients
+coefficients <- coef(final_model_taskW_elastic_net, s = best_lambda)
+coef_df <- as.data.frame(as.matrix(coefficients))
+names(coef_df) <- "Coefficient"
+coef_df$Variable <- rownames(coef_df)
+
+# Remove intercept and zero coefficients
+coef_df <- coef_df[-1, ]  # First row is the intercept
+coef_df <- coef_df[coef_df$Coefficient != 0, ]  # Remove zero coefficients
+
+# Calculate absolute values for ordering and direction
+coef_df$AbsoluteValue <- abs(coef_df$Coefficient)
+
+# Order by absolute value, highest first
+coef_df <- coef_df[order(-coef_df$AbsoluteValue), ]
+
+# Plot using ggplot2
+ggplot(coef_df[1:10,], aes(x = reorder(Variable, AbsoluteValue), y = AbsoluteValue, fill = Coefficient > 0)) +
+  geom_bar(stat = "identity", width = 0.75) +
+  coord_flip() +  # Make the bar plot horizontal
+  scale_fill_manual(values = c("orange", "lightblue"), labels = c("Negative", "Positive"), name = "Direction") +  # Orange for negative, blue for positive
+  labs(x = "", y = "Coefficient Value", title = "Task W: Elastic Net Final Model") +
+  theme_minimal() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        axis.text.x = element_text(size = 10, color = "black"),
+        axis.text.y = element_text(size = 10, color = "black"),
+        axis.line = element_line(color = "black"),  
+        axis.ticks = element_line(color = "black"), 
+        axis.ticks.length = unit(0.15, "cm"))  
+
+```
+
+# Plot SHAP Values of Final Elastic Net Model
+Simulations = 1000
+```{r}
+# Start timer
+start_time <- Sys.time()
+
+shap <- fastshap::explain(taskW_elastic_net, X = taskW_final[,7:328], pred_wrapper = pred_train, nsim = 1000)
+
+plot_shap_bar(shap, taskW_final[,7:328], top = 10)
+
+# End timer
+end_time <- Sys.time() 
+end_time - start_time
+
+```
+
+# Create Beeswarm Plot
+```{r}
+
+plot_shap_beeswarm(shap, taskW_final[,7:328], size = 1, top = 6)
+
+```
+
+# Random Forest with Nested Cross-Validation
+```{r}
+# Enable parallel processing
+cl <- makeCluster(detectCores(), type = "PSOCK")
+registerDoParallel(cl)
+
+start_time <- Sys.time()
+
+# set seed
+set.seed(seed = 123)
+
+# Random forest with nested cross-validation
+taskW_rf <- nestcv.train(x = taskW_final[,7:328], 
+                         y = taskW_final$T3_PHQ9_Total,  
+                     method = "rf",
+                     metric = "RMSE",
+                     savePredictions = "final",
+                     filterFUN = "correl_filter",
+                     n_outer_folds = 10,
+                     n_inner_folds = 10,
+                     finalCV = TRUE,
+                     preProcess = c("center", "scale", "corr"),
+                     preProcOptions = list(cutoff = 0.75),
+                     tuneGrid = expand.grid(mtry = 1:40))
+
+end_time <- Sys.time()
+end_time - start_time
+
+# Hyperparameters of final model
+taskW_rf$finalTune
+
+# Results summary
+max(taskW_rf$final_fit$results$Rsquared,na.rm = TRUE) # r-squared of best parameters fit to the whole dataset
+taskW_rf$summary # accounting for overfitting
+
+# Frequency with which predictor variables are kept in final model
+var_stability(taskW_rf)
+taskW_rf_var_stability <- plot_var_stability(taskW_rf, final = FALSE) 
+taskW_rf_var_stability
+
+# Variables in final model fit
+taskW_rf$final_fit # number of variables 
+taskW_rf$final_vars # names of variables
+
+# Save variable stability plot
+ggsave(filename = "taskW_rf_var_stability.jpeg", plot = taskW_rf_var_stability, device = "jpeg", width = 20, height = 15, units = "cm")
+
+```
+
+# Support Vector Machine with Nested Cross-Validation
+```{r}
+# Enable parallel processing
+cl <- makeCluster(detectCores(), type = "PSOCK")
+registerDoParallel(cl)
+
+start_time <- Sys.time()
+
+# set seed
+set.seed(seed = 123)
+
+# Support Vector Machine (Linear) with nested cross-validation
+taskW_svm <- nestcv.train(x = taskW_final[,7:328],
+                          y = taskW_final$T3_PHQ9_Total, 
+                     method = "svmLinear",
+                     metric = "RMSE",
+                     savePredictions = "final",
+                     filterFUN = "correl_filter",
+                     n_outer_folds = 10,
+                     n_inner_folds = 10,
+                     finalCV = TRUE,
+                     preProcess = c("center", "scale", "corr"),
+                     preProcOptions = list(cutoff = 0.75),
+                     tuneGrid = expand.grid(C = 2^c(-10:10)))
+
+end_time <- Sys.time()
+end_time - start_time
+
+# Hyperparameters of final model
+taskW_svm$finalTune
+
+# Results Summary
+max(taskW_svm$final_fit$results$Rsquared,na.rm = TRUE) # r-squared of best parameters fit to the whole dataset
+taskW_svm$summary # accounting for overfitting
+
+# Frequency with which predictor variables are kept in final model
+var_stability(taskW_svm)
+taskW_svm_var_stability <- plot_var_stability(taskW_svm, final = FALSE, top = 10) 
+taskW_svm_var_stability
+
+# Variables in final model fit
+taskW_svm$final_fit # number of variables 
+taskW_svm$final_vars # names of variables
+
+```
